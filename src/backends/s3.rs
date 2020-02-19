@@ -15,6 +15,7 @@ use reqwest;
 use std::cmp::Ordering;
 use std::env;
 use std::path::{Path, PathBuf};
+use async_trait::async_trait;
 
 /// Maximum number of items to retrieve from S3 API
 const MAX_KEYS: u8 = 100;
@@ -26,9 +27,16 @@ pub struct ReleaseListBuilder {
     asset_prefix: Option<String>,
     target: Option<String>,
     region: Option<String>,
+    client: Option<reqwest::Client>,
 }
 
 impl ReleaseListBuilder {
+    /// Set the reqwest client
+    pub fn client(&mut self, client: reqwest::Client) -> &mut Self {
+        self.client = Some(client);
+        self
+    }
+
     /// Set the bucket name, used to build an S3 api url
     pub fn bucket_name(&mut self, name: &str) -> &mut Self {
         self.bucket_name = Some(name.to_owned());
@@ -56,6 +64,11 @@ impl ReleaseListBuilder {
     /// Verify builder args, returning a `ReleaseList`
     pub fn build(&self) -> Result<ReleaseList> {
         Ok(ReleaseList {
+            client: if let Some(client) = self.client {
+                client
+            } else {
+                bail!(Error::Config, "`client` required")
+            },
             bucket_name: if let Some(ref name) = self.bucket_name {
                 name.to_owned()
             } else {
@@ -80,6 +93,7 @@ pub struct ReleaseList {
     asset_prefix: Option<String>,
     target: Option<String>,
     region: String,
+    client: reqwest::Client,
 }
 
 impl ReleaseList {
@@ -90,13 +104,14 @@ impl ReleaseList {
             asset_prefix: None,
             target: None,
             region: None,
+            client: None,
         }
     }
 
     /// Retrieve a list of `Release`s.
     /// If specified, filter for those containing a specified `target`
-    pub fn fetch(&self) -> Result<Vec<Release>> {
-        let releases = fetch_releases_from_s3(&self.bucket_name, &self.region, &self.asset_prefix)?;
+    pub async fn fetch(&self) -> Result<Vec<Release>> {
+        let releases = fetch_releases_from_s3(&self.client, &self.bucket_name, &self.region, &self.asset_prefix).await?;
         let releases = match self.target {
             None => releases,
             Some(ref target) => releases
@@ -128,6 +143,7 @@ pub struct UpdateBuilder {
     target_version: Option<String>,
     progress_style: Option<ProgressStyle>,
     auth_token: Option<String>,
+    client: Option<reqwest::Client>,
 }
 
 impl Default for UpdateBuilder {
@@ -147,6 +163,7 @@ impl Default for UpdateBuilder {
             target_version: None,
             progress_style: None,
             auth_token: None,
+            client: None
         }
     }
 }
@@ -156,6 +173,12 @@ impl UpdateBuilder {
     /// Initialize a new builder
     pub fn new() -> Self {
         Default::default()
+    }
+
+    /// Set the reqwest client
+    pub fn client(&mut self, client: reqwest::Client) -> &mut Self {
+        self.client = Some(client);
+        self
     }
 
     /// Set the repo name, used to build a github api url
@@ -291,6 +314,12 @@ impl UpdateBuilder {
         };
 
         Ok(Box::new(Update {
+            client: if let Some(client) = self.client {
+                client
+            } else {
+                bail!(Error::Config, "`client` required")
+            },
+
             bucket_name: if let Some(ref name) = self.bucket_name {
                 name.to_owned()
             } else {
@@ -350,6 +379,7 @@ pub struct Update {
     no_confirm: bool,
     progress_style: Option<ProgressStyle>,
     auth_token: Option<String>,
+    client: reqwest::Client,
 }
 
 impl Update {
@@ -357,11 +387,20 @@ impl Update {
     pub fn configure() -> UpdateBuilder {
         UpdateBuilder::new()
     }
+    fn client_inner(&self) -> reqwest::Client {
+        self.client
+    }
 }
 
+#[async_trait]
 impl ReleaseUpdate for Update {
-    fn get_latest_release(&self) -> Result<Release> {
-        let releases = fetch_releases_from_s3(&self.bucket_name, &self.region, &self.asset_prefix)?;
+    fn get_client(&self) -> &reqwest::Client {
+        &self.client_inner()
+    }
+
+    async fn get_latest_release(&self) -> Result<Release> {
+        let client = self.get_client();
+        let releases = fetch_releases_from_s3(client, &self.bucket_name, &self.region, &self.asset_prefix).await?;
         let rel = releases
             .iter()
             .max_by(|x, y| match bump_is_greater(&y.version, &x.version) {
@@ -384,8 +423,9 @@ impl ReleaseUpdate for Update {
         }
     }
 
-    fn get_release_version(&self, ver: &str) -> Result<Release> {
-        let releases = fetch_releases_from_s3(&self.bucket_name, &self.region, &self.asset_prefix)?;
+    async fn get_release_version(&self, ver: &str) -> Result<Release> {
+        let client = self.get_client();
+        let releases = fetch_releases_from_s3(client, &self.bucket_name, &self.region, &self.asset_prefix).await?;
         let rel = releases.iter().find(|x| x.version == ver);
         match rel {
             Some(r) => Ok(r.clone()),
@@ -444,7 +484,8 @@ impl ReleaseUpdate for Update {
 
 // Obtain list of releases from AWS S3 API, from bucket and region specified,
 // filtering assets which don't match the prefix string if provided
-fn fetch_releases_from_s3(
+async fn fetch_releases_from_s3(
+    client: &reqwest::Client,
     bucket_name: &str,
     region: &str,
     asset_prefix: &Option<String>,
@@ -460,7 +501,7 @@ fn fetch_releases_from_s3(
 
     let download_base_url = format!("https://{}.s3.{}.amazonaws.com/", bucket_name, region);
 
-    let resp = reqwest::blocking::Client::new().get(&api_url).send()?;
+    let resp = client.get(&api_url).send().await?;
     if !resp.status().is_success() {
         bail!(
             Error::Network,
@@ -470,7 +511,7 @@ fn fetch_releases_from_s3(
         )
     }
 
-    let body = resp.text()?;
+    let body = resp.text().await?;
     let mut reader = Reader::from_str(&body);
     reader.trim_text(true);
 

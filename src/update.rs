@@ -6,6 +6,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tempdir;
+use async_trait::async_trait;
 
 use crate::{confirm, errors::*, version, Download, Extract, Move, Status};
 
@@ -74,12 +75,16 @@ impl Release {
 }
 
 /// Updates to a specified or latest release
+#[async_trait]
 pub trait ReleaseUpdate {
+    /// Fetch a client from the underlying implementor
+    fn get_client(&self) -> &reqwest::Client;
+
     /// Fetch details of the latest release from the backend
-    fn get_latest_release(&self) -> Result<Release>;
+    async fn get_latest_release(&self) -> Result<Release>;
 
     /// Fetch details of the release matching the specified version
-    fn get_release_version(&self, ver: &str) -> Result<Release>;
+    async fn get_release_version(&self, ver: &str) -> Result<Release>;
 
     /// Current version of binary being updated
     fn current_version(&self) -> String;
@@ -90,7 +95,7 @@ pub trait ReleaseUpdate {
     /// Target version optionally specified for the update
     fn target_version(&self) -> Option<String>;
 
-    /// Name of the binary being updated
+    /// Name of the binary being ReleaseUpdateupdated
     fn bin_name(&self) -> String;
 
     /// Installation path for the binary being updated
@@ -116,14 +121,16 @@ pub trait ReleaseUpdate {
 
     /// Display release information and update the current binary to the latest release, pending
     /// confirmation from the user
-    fn update(&self) -> Result<Status> {
+    async fn update(&self) -> Result<Status> {
         let current_version = self.current_version();
-        self.update_extended()
-            .map(|s| s.into_status(current_version))
+        match self.update_extended().await {
+            Ok(s) => Ok(s.into_status(current_version)),
+            Err(e) => return Err(e),
+        }
     }
 
     /// Same as `update`, but returns `UpdateStatus`.
-    fn update_extended(&self) -> Result<UpdateStatus> {
+    async fn update_extended(&self) -> Result<UpdateStatus> {
         let current_version = self.current_version();
         let target = self.target();
         let show_output = self.show_output();
@@ -136,7 +143,7 @@ pub trait ReleaseUpdate {
         let release = match self.target_version() {
             None => {
                 print_flush(show_output, "Checking latest released version... ")?;
-                let release = self.get_latest_release()?;
+                let release = self.get_latest_release().await?;
                 {
                     println(show_output, &format!("v{}", release.version));
 
@@ -166,7 +173,7 @@ pub trait ReleaseUpdate {
             }
             Some(ref ver) => {
                 println(show_output, &format!("Looking for tag: {}", ver));
-                self.get_release_version(ver)?
+                self.get_release_version(ver).await?
             }
         };
 

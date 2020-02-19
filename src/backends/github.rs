@@ -8,6 +8,7 @@ use hyper_old_types::header::{LinkValue, RelationType};
 use indicatif::ProgressStyle;
 use reqwest::{self, header};
 use serde_json;
+use async_trait::async_trait;
 
 use crate::{
     errors::*,
@@ -66,6 +67,7 @@ pub struct ReleaseListBuilder {
     repo_name: Option<String>,
     target: Option<String>,
     auth_token: Option<String>,
+    client: Option<reqwest::Client>
 }
 impl ReleaseListBuilder {
     /// Set the repo owner, used to build a github api url
@@ -86,6 +88,12 @@ impl ReleaseListBuilder {
         self
     }
 
+    /// Set the reqwest client
+    pub fn client(&mut self, client: reqwest::Client) -> &mut Self {
+        self.client = Some(client);
+        self
+    }
+
     /// Set the authorization token, used in requests to the github api url
     ///
     /// This is to support private repos where you need a GitHub auth token.
@@ -100,6 +108,11 @@ impl ReleaseListBuilder {
     /// Verify builder args, returning a `ReleaseList`
     pub fn build(&self) -> Result<ReleaseList> {
         Ok(ReleaseList {
+            client: if let Some(client) = self.client {
+                client
+            } else {
+                bail!(Error::Config, "`client` required")
+            },
             repo_owner: if let Some(ref owner) = self.repo_owner {
                 owner.to_owned()
             } else {
@@ -124,6 +137,7 @@ pub struct ReleaseList {
     repo_name: String,
     target: Option<String>,
     auth_token: Option<String>,
+    client: reqwest::Client,
 }
 impl ReleaseList {
     /// Initialize a ReleaseListBuilder
@@ -133,18 +147,19 @@ impl ReleaseList {
             repo_name: None,
             target: None,
             auth_token: None,
+            client: None
         }
     }
 
     /// Retrieve a list of `Release`s.
     /// If specified, filter for those containing a specified `target`
-    pub fn fetch(self) -> Result<Vec<Release>> {
+    pub async fn fetch(self) -> Result<Vec<Release>> {
         set_ssl_vars!();
         let api_url = format!(
             "https://api.github.com/repos/{}/{}/releases",
             self.repo_owner, self.repo_name
         );
-        let releases = self.fetch_releases(&api_url)?;
+        let releases = self.fetch_releases(&api_url).await?;
         let releases = match self.target {
             None => releases,
             Some(ref target) => releases
@@ -155,11 +170,12 @@ impl ReleaseList {
         Ok(releases)
     }
 
-    fn fetch_releases(&self, url: &str) -> Result<Vec<Release>> {
-        let resp = reqwest::blocking::Client::new()
+    async fn fetch_releases(&self, url: &str) -> Result<Vec<Release>> {
+        let resp = self.client
             .get(url)
             .headers(api_headers(&self.auth_token)?)
-            .send()?;
+            .send()
+            .await?;
         if !resp.status().is_success() {
             bail!(
                 Error::Network,
@@ -170,7 +186,7 @@ impl ReleaseList {
         }
         let headers = resp.headers().clone();
 
-        let releases = resp.json::<serde_json::Value>()?;
+        let releases = resp.json::<serde_json::Value>().await?;
         let releases = releases
             .as_array()
             .ok_or_else(|| format_err!(Error::Release, "No releases found"))?;
@@ -203,7 +219,7 @@ impl ReleaseList {
         Ok(match next_link {
             None => releases,
             Some(link) => {
-                releases.extend(self.fetch_releases(link)?);
+                releases.extend(self.fetch_releases(link).await?);
                 releases
             }
         })
@@ -229,6 +245,7 @@ pub struct UpdateBuilder {
     target_version: Option<String>,
     progress_style: Option<ProgressStyle>,
     auth_token: Option<String>,
+    client: Option<reqwest::Client>,
 }
 
 impl UpdateBuilder {
@@ -240,6 +257,12 @@ impl UpdateBuilder {
     /// Set the repo owner, used to build a github api url
     pub fn repo_owner(&mut self, owner: &str) -> &mut Self {
         self.repo_owner = Some(owner.to_owned());
+        self
+    }
+
+    /// Set the reqwest client
+    pub fn client(&mut self, client: reqwest::Client) -> &mut Self {
+        self.client = Some(client);
         self
     }
 
@@ -370,6 +393,11 @@ impl UpdateBuilder {
         };
 
         Ok(Box::new(Update {
+            client: if let Some(client) = self.client {
+                client
+            } else {
+                bail!(Error::Config, "`client` required")
+            },
             repo_owner: if let Some(ref owner) = self.repo_owner {
                 owner.to_owned()
             } else {
@@ -427,25 +455,35 @@ pub struct Update {
     no_confirm: bool,
     progress_style: Option<ProgressStyle>,
     auth_token: Option<String>,
+    client: reqwest::Client,
 }
 impl Update {
     /// Initialize a new `Update` builder
-    pub fn configure() -> UpdateBuilder {
+    pub fn configure(client: reqwest::Client) -> UpdateBuilder {
         UpdateBuilder::new()
+    }
+
+    fn client_inner(&self) -> reqwest::Client {
+        self.client
     }
 }
 
+#[async_trait]
 impl ReleaseUpdate for Update {
-    fn get_latest_release(&self) -> Result<Release> {
+    fn get_client(&self) -> reqwest::Client {
+        self.client_inner()
+    }
+    async fn get_latest_release(&self) -> Result<Release> {
         set_ssl_vars!();
         let api_url = format!(
             "https://api.github.com/repos/{}/{}/releases/latest",
             self.repo_owner, self.repo_name
         );
-        let resp = reqwest::blocking::Client::new()
+        let resp = self.get_client()
             .get(&api_url)
             .headers(api_headers(&self.auth_token)?)
-            .send()?;
+            .send()
+            .await?;
         if !resp.status().is_success() {
             bail!(
                 Error::Network,
@@ -454,20 +492,21 @@ impl ReleaseUpdate for Update {
                 api_url
             )
         }
-        let json = resp.json::<serde_json::Value>()?;
+        let json = resp.json::<serde_json::Value>().await?;
         Ok(Release::from_release(&json)?)
     }
 
-    fn get_release_version(&self, ver: &str) -> Result<Release> {
+    async fn get_release_version(&self, ver: &str) -> Result<Release> {
         set_ssl_vars!();
         let api_url = format!(
             "https://api.github.com/repos/{}/{}/releases/tags/{}",
             self.repo_owner, self.repo_name, ver
         );
-        let resp = reqwest::blocking::Client::new()
+        let resp = self.get_client()
             .get(&api_url)
             .headers(api_headers(&self.auth_token)?)
-            .send()?;
+            .send()
+            .await?;
         if !resp.status().is_success() {
             bail!(
                 Error::Network,
@@ -476,7 +515,7 @@ impl ReleaseUpdate for Update {
                 api_url
             )
         }
-        let json = resp.json::<serde_json::Value>()?;
+        let json = resp.json::<serde_json::Value>().await?;
         Ok(Release::from_release(&json)?)
     }
 
@@ -541,6 +580,7 @@ impl Default for UpdateBuilder {
             target_version: None,
             progress_style: None,
             auth_token: None,
+            client: None,
         }
     }
 }
